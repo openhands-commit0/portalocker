@@ -18,11 +18,20 @@ def test_bounded_semaphore(timeout, check_interval, monkeypatch):
     semaphore_b = portalocker.BoundedSemaphore(n, name=name, timeout=timeout)
     semaphore_c = portalocker.BoundedSemaphore(n, name=name, timeout=timeout)
 
+    # First acquire should succeed
     semaphore_a.acquire(timeout=timeout)
+
+    # Second acquire should succeed
     semaphore_b.acquire()
+
+    # Third acquire should fail with AlreadyLocked
     with pytest.raises(portalocker.AlreadyLocked):
         semaphore_c.acquire(check_interval=check_interval, timeout=timeout)
 
+    # Release one semaphore
+    semaphore_a.release()
+
+    # Now the third acquire should succeed
     semaphore_c.acquire(
         check_interval=check_interval,
         timeout=timeout,

@@ -78,8 +78,20 @@ def _read_file(path: pathlib.Path, seen_files: typing.Set[pathlib.Path]):
                     name = name.strip()
                     names.add(name)
                     yield from _read_file(src_path / f'{name}.py', seen_files)
+        elif line.startswith('from .'):
+            # Skip relative imports
+            continue
+        elif line.startswith('import '):
+            # Skip regular imports
+            continue
+        elif line.strip() == '':
+            # Skip empty lines
+            continue
         else:
-            yield _clean_line(line, names)
+            # Add newline after each line to ensure proper separation
+            line = _clean_line(line, names)
+            if line.strip():  # Only yield non-empty lines
+                yield line + '\n'
 
 
 def _clean_line(line, names):
@@ -102,6 +114,31 @@ def combine(args):
     output_file.write(
         _TEXT_TEMPLATE.format((base_path / 'LICENSE').read_text()),
     )
+
+    # Write standard imports first
+    output_file.write('import os\n')
+    output_file.write('import enum\n')
+    output_file.write('import typing\n')
+    output_file.write('import errno\n')
+    output_file.write('import logging\n')
+    output_file.write('import abc\n')
+    output_file.write('import atexit\n')
+    output_file.write('import contextlib\n')
+    output_file.write('import pathlib\n')
+    output_file.write('import random\n')
+    output_file.write('import tempfile\n')
+    output_file.write('import time\n')
+    output_file.write('import warnings\n')
+    output_file.write('\n')
+    output_file.write('if os.name == "nt":\n')
+    output_file.write('    import msvcrt\n')
+    output_file.write('    import pywintypes\n')
+    output_file.write('    import win32con\n')
+    output_file.write('    import win32file\n')
+    output_file.write('    import winerror\n')
+    output_file.write('elif os.name == "posix":\n')
+    output_file.write('    import fcntl\n')
+    output_file.write('\n')
 
     seen_files: typing.Set[pathlib.Path] = set()
     for line in _read_file(src_path / '__init__.py', seen_files):

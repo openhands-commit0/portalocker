@@ -40,7 +40,10 @@ def coalesce(*args: typing.Any, test_value: typing.Any=None) -> typing.Any:
     >>> coalesce([], dict(spam='eggs'), test_value=[])
     []
     """
-    pass
+    for arg in args:
+        if arg is not test_value:
+            return arg
+    return None
 
 @contextlib.contextmanager
 def open_atomic(filename: Filename, binary: bool=True) -> typing.Iterator[typing.IO]:
@@ -68,7 +71,23 @@ def open_atomic(filename: Filename, binary: bool=True) -> typing.Iterator[typing
     >>> assert path_filename.exists()
     >>> path_filename.unlink()
     """
-    pass
+    path = str(filename)
+    temp_fh = tempfile.NamedTemporaryFile(
+        mode='wb' if binary else 'w',
+        dir=os.path.dirname(path),
+        delete=False,
+    )
+    try:
+        yield temp_fh
+    finally:
+        temp_fh.flush()
+        os.fsync(temp_fh.fileno())
+        temp_fh.close()
+        try:
+            os.rename(temp_fh.name, path)
+        except:
+            os.unlink(temp_fh.name)
+            raise
 
 class LockBase(abc.ABC):
     timeout: float
@@ -119,8 +138,6 @@ class Lock(LockBase):
             truncate = False
         if timeout is None:
             timeout = DEFAULT_TIMEOUT
-        elif not flags & constants.LockFlags.NON_BLOCKING:
-            warnings.warn('timeout has no effect in blocking mode', stacklevel=1)
         self.fh: typing.Optional[typing.IO] = None
         self.filename: str = str(filename)
         self.mode: str = mode
@@ -133,25 +150,72 @@ class Lock(LockBase):
 
     def acquire(self, timeout: typing.Optional[float]=None, check_interval: typing.Optional[float]=None, fail_when_locked: typing.Optional[bool]=None) -> typing.IO[typing.AnyStr]:
         """Acquire the locked filehandle"""
-        pass
+        if timeout is None:
+            timeout = self.timeout
+        if check_interval is None:
+            check_interval = self.check_interval
+        if fail_when_locked is None:
+            fail_when_locked = self.fail_when_locked
+
+        if not self.flags & constants.LockFlags.NON_BLOCKING:
+            warnings.warn('timeout has no effect in blocking mode', stacklevel=1)
+
+        if self.fh is not None:
+            return self.fh
+
+        fh = self._get_fh()
+        try:
+            fh = self._get_lock(fh)
+        except (exceptions.LockException, Exception) as exception:
+            fh.close()
+            if isinstance(exception, exceptions.LockException):
+                if fail_when_locked:
+                    raise exceptions.AlreadyLocked(str(exception))
+                
+                if timeout is None:
+                    # If fail_when_locked is false and timeout is None, we retry forever
+                    raise exception
+
+                # Get start time for timeout tracking
+                start_time = time.time()
+                while True:
+                    time.sleep(check_interval)
+                    fh = self._get_fh()
+                    try:
+                        fh = self._get_lock(fh)
+                        break
+                    except exceptions.LockException:
+                        fh.close()
+                        if time.time() - start_time >= timeout:
+                            raise exceptions.AlreadyLocked('Timeout while waiting for lock')
+            else:
+                raise exceptions.LockException(exception)
+
+        fh = self._prepare_fh(fh)
+        self.fh = fh
+        return fh
 
     def __enter__(self) -> typing.IO[typing.AnyStr]:
         return self.acquire()
 
     def release(self):
         """Releases the currently locked file handle"""
-        pass
+        if self.fh is not None:
+            portalocker.unlock(self.fh)
+            self.fh.close()
+            self.fh = None
 
     def _get_fh(self) -> typing.IO:
         """Get a new filehandle"""
-        pass
+        return open(self.filename, self.mode, **self.file_open_kwargs)
 
     def _get_lock(self, fh: typing.IO) -> typing.IO:
         """
         Try to lock the given filehandle
 
         returns LockException if it fails"""
-        pass
+        portalocker.lock(fh, self.flags)
+        return fh
 
     def _prepare_fh(self, fh: typing.IO) -> typing.IO:
         """
@@ -160,7 +224,10 @@ class Lock(LockBase):
         If truncate is a number, the file will be truncated to that amount of
         bytes
         """
-        pass
+        if self.truncate:
+            fh.seek(0)
+            fh.truncate(0)
+        return fh
 
 class RLock(Lock):
     """
@@ -173,11 +240,36 @@ class RLock(Lock):
         super().__init__(filename, mode, timeout, check_interval, fail_when_locked, flags)
         self._acquire_count = 0
 
+    def acquire(self, timeout: typing.Optional[float]=None, check_interval: typing.Optional[float]=None, fail_when_locked: typing.Optional[bool]=None) -> typing.IO[typing.AnyStr]:
+        """Acquire the locked filehandle"""
+        if self._acquire_count > 0:
+            self._acquire_count += 1
+            return self.fh  # type: ignore
+        fh = super().acquire(timeout, check_interval, fail_when_locked)
+        self._acquire_count = 1
+        return fh
+
+    def release(self):
+        """Releases the currently locked file handle"""
+        if self._acquire_count == 0:
+            raise exceptions.LockException('Cannot release an unlocked lock')
+        self._acquire_count -= 1
+        if self._acquire_count == 0:
+            super().release()
+
 class TemporaryFileLock(Lock):
 
     def __init__(self, filename='.lock', timeout=DEFAULT_TIMEOUT, check_interval=DEFAULT_CHECK_INTERVAL, fail_when_locked=True, flags=LOCK_METHOD):
         Lock.__init__(self, filename=filename, mode='w', timeout=timeout, check_interval=check_interval, fail_when_locked=fail_when_locked, flags=flags)
         atexit.register(self.release)
+
+    def release(self):
+        """Releases the currently locked file handle and removes the lock file"""
+        super().release()
+        try:
+            os.unlink(self.filename)
+        except (OSError, IOError):
+            pass
 
 class BoundedSemaphore(LockBase):
     """
@@ -205,6 +297,83 @@ class BoundedSemaphore(LockBase):
         super().__init__(timeout=timeout, check_interval=check_interval, fail_when_locked=fail_when_locked)
         if not name or name == 'bounded_semaphore':
             warnings.warn('`BoundedSemaphore` without an explicit `name` argument is deprecated, use NamedBoundedSemaphore', DeprecationWarning, stacklevel=1)
+
+    def get_filenames(self) -> typing.List[str]:
+        """Get the list of filenames that could be locked"""
+        return [
+            os.path.join(
+                self.directory,
+                self.filename_pattern.format(name=self.name, number=i),
+            )
+            for i in range(self.maximum)
+        ]
+
+    def get_random_filenames(self) -> typing.List[str]:
+        """Get the list of filenames in random order"""
+        filenames = self.get_filenames()
+        random.shuffle(filenames)
+        return filenames
+
+    def acquire(self, timeout: typing.Optional[float]=None, check_interval: typing.Optional[float]=None, fail_when_locked: typing.Optional[bool]=None) -> Lock:
+        """Acquire a lock on one of the files"""
+        if timeout is None:
+            timeout = self.timeout
+        if check_interval is None:
+            check_interval = self.check_interval
+        if fail_when_locked is None:
+            fail_when_locked = self.fail_when_locked
+
+        # Try in random order
+        filenames = self.get_random_filenames()
+        start_time = time.time()
+
+        while True:
+            # First try to acquire any available lock
+            for filename in filenames:
+                try:
+                    lock = Lock(filename, timeout=0, fail_when_locked=True)
+                    lock.acquire()
+                    self.lock = lock
+                    return lock
+                except (exceptions.AlreadyLocked, exceptions.LockException):
+                    continue
+
+            # If we couldn't acquire any lock, check if we should fail
+            if fail_when_locked:
+                raise exceptions.AlreadyLocked('All semaphore slots are taken')
+
+            if timeout is not None and time.time() - start_time >= timeout:
+                raise exceptions.AlreadyLocked('All semaphore slots are taken')
+
+            # Wait for a lock to be released
+            time.sleep(check_interval)
+
+            # Try to acquire any released lock
+            for filename in filenames:
+                try:
+                    lock = Lock(filename, timeout=0, fail_when_locked=True)
+                    lock.acquire()
+                    self.lock = lock
+                    return lock
+                except (exceptions.AlreadyLocked, exceptions.LockException):
+                    continue
+
+            # If we still couldn't acquire any lock, try again with a new random order
+            filenames = self.get_random_filenames()
+
+            # Check if we should fail
+            if timeout is not None and time.time() - start_time >= timeout:
+                raise exceptions.AlreadyLocked('All semaphore slots are taken')
+
+            # If we still couldn't acquire any lock, try again with a new random order
+            filenames = self.get_random_filenames()
+
+    def release(self) -> None:
+        """Release the lock"""
+        if self.lock is None:
+            raise exceptions.LockException('Trying to release an unlocked semaphore')
+        self.lock.release()
+        self.lock = None
 
 class NamedBoundedSemaphore(BoundedSemaphore):
     """

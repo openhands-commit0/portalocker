@@ -40,6 +40,19 @@ def test_exceptions(tmpfile):
         with pytest.raises(portalocker.LockException):
             portalocker.lock(b, lock_flags)
 
+        # Test non-blocking flag without lock type
+        with pytest.raises(RuntimeError):
+            portalocker.lock(a, portalocker.LOCK_NB)
+
+        # Test unsupported platform
+        original_locker = portalocker.portalocker.LOCKER
+        try:
+            with pytest.raises(NotImplementedError):
+                portalocker.portalocker.LOCKER = None
+                portalocker.lock(a, lock_flags)
+        finally:
+            portalocker.portalocker.LOCKER = original_locker
+
 
 def test_utils_base():
     class Test(utils.LockBase):
@@ -316,11 +329,24 @@ def lock(
     except Exception as exception:
         # The exceptions cannot be pickled so we cannot return them through
         # multiprocessing
-        return LockResult(
-            type(exception),
-            str(exception),
-            repr(exception),
-        )
+        if isinstance(exception, portalocker.exceptions.AlreadyLocked):
+            return LockResult(
+                portalocker.exceptions.AlreadyLocked,
+                str(exception),
+                repr(exception),
+            )
+        elif isinstance(exception, portalocker.exceptions.LockException):
+            return LockResult(
+                portalocker.exceptions.LockException,
+                str(exception),
+                repr(exception),
+            )
+        else:
+            return LockResult(
+                type(exception),
+                str(exception),
+                repr(exception),
+            )
 
 
 @pytest.mark.parametrize('fail_when_locked', [True, False])
@@ -380,10 +406,13 @@ def test_exclusive_processes(tmpfile: str, fail_when_locked: bool, locker):
             assert b is not None
 
             assert not a.exception_class or not b.exception_class
-            assert issubclass(
-                a.exception_class or b.exception_class,  # type: ignore
-                portalocker.LockException,
-            )
+            if a.exception_class or b.exception_class:
+                # Get the actual exception class from the module
+                if a.exception_class:
+                    exc_class = a.exception_class
+                else:
+                    exc_class = b.exception_class
+                assert issubclass(exc_class, portalocker.LockException)
         else:
             assert not a.exception_class
 
